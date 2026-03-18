@@ -1,5 +1,5 @@
 {
   "name": "MorphoSynch - Spectromorphological Synthesizer",
   "description": "An advanced audiovisual generator based on spectromorphology and transmodal perception, using energy trajectories to drive unified sound and vision transformations.",
-  "requestFramePermissions": []
+  "requestFramePermissions": ["microphone"]
 }

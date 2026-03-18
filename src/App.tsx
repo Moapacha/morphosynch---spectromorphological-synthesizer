@@ -18,7 +18,9 @@ import {
   Layers,
   Maximize2,
   ChevronRight,
-  ChevronDown
+  ChevronDown,
+  Volume2,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as d3 from 'd3-shape';
@@ -205,6 +207,9 @@ export default function App() {
   const [engine, setEngine] = useState<EngineState & { zoom: number }>({ isPlaying: false, time: 0, duration: 4.0, zoom: 1 });
   const [activeCurveId, setActiveCurveId] = useState<string>('macro-1');
   const [showVisualSettings, setShowVisualSettings] = useState(false);
+  const [showAudioSettings, setShowAudioSettings] = useState(false);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>('default');
   
   // Use a ref for curves to ensure the high-frequency loop always has the latest data
   const curvesRef = useRef<MorphologyCurve[]>(curves);
@@ -263,6 +268,46 @@ export default function App() {
   const requestRef = useRef<number>(null);
   const startTimeRef = useRef<number>(0);
 
+  // --- Audio Device Management ---
+  const refreshAudioDevices = useCallback(async () => {
+    try {
+      // Request permission to get labels if needed
+      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const hasLabels = devices.some(d => d.label !== '');
+        
+        if (!hasLabels) {
+          // Trigger a brief permission request to get labels
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach(track => track.stop());
+        }
+
+        const allDevices = await navigator.mediaDevices.enumerateDevices();
+        const outputs = allDevices.filter(device => device.kind === 'audiooutput');
+        setAudioDevices(outputs);
+      }
+    } catch (err) {
+      console.error("Error enumerating audio devices:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshAudioDevices();
+    navigator.mediaDevices?.addEventListener('devicechange', refreshAudioDevices);
+    return () => navigator.mediaDevices?.removeEventListener('devicechange', refreshAudioDevices);
+  }, [refreshAudioDevices]);
+
+  const handleAudioDeviceChange = async (deviceId: string) => {
+    setSelectedAudioDeviceId(deviceId);
+    if (audioCtxRef.current && (audioCtxRef.current as any).setSinkId) {
+      try {
+        await (audioCtxRef.current as any).setSinkId(deviceId);
+      } catch (err) {
+        console.error("Failed to set audio sink:", err);
+      }
+    }
+  };
+
   // --- Audio Engine ---
   const initAudio = useCallback(() => {
     if (audioCtxRef.current) return;
@@ -304,9 +349,6 @@ export default function App() {
     noise.start();
 
     audioNodesRef.current = { osc, filter, noise, noiseGain, masterGain };
-
-    // Required: resume AudioContext after user gesture (browser autoplay policy)
-    ctx.resume();
   }, []);
 
   // --- Curve Math ---
@@ -369,11 +411,11 @@ export default function App() {
       const { osc, filter, noiseGain, masterGain } = audioNodesRef.current;
       const now = audioCtxRef.current.currentTime;
       
-      osc.frequency.setTargetAtTime(values['audio.freq'] ?? 440, now, 0.05);
-      filter.frequency.setTargetAtTime(values['audio.cutoff'] ?? 2000, now, 0.05);
-      filter.Q.setTargetAtTime(values['audio.resonance'] ?? 1, now, 0.05);
-      noiseGain.gain.setTargetAtTime(values['audio.noise'] ?? 0, now, 0.05);
-      masterGain.gain.setTargetAtTime(values['audio.gain'] ?? 0, now, 0.05);
+      if (values['audio.freq']) osc.frequency.setTargetAtTime(values['audio.freq'], now, 0.05);
+      if (values['audio.cutoff']) filter.frequency.setTargetAtTime(values['audio.cutoff'], now, 0.05);
+      if (values['audio.resonance']) filter.Q.setTargetAtTime(values['audio.resonance'], now, 0.05);
+      if (values['audio.noise']) noiseGain.gain.setTargetAtTime(values['audio.noise'], now, 0.05);
+      if (values['audio.gain']) masterGain.gain.setTargetAtTime(values['audio.gain'], now, 0.05);
     }
 
     // Visual Update
@@ -503,14 +545,8 @@ export default function App() {
     };
   }, [engine.isPlaying, update]);
 
-  const togglePlay = async () => {
-    if (!engine.isPlaying) {
-      initAudio();
-      // Must await resume - AudioContext starts suspended; audio is silent until resumed
-      if (audioCtxRef.current?.state === 'suspended') {
-        await audioCtxRef.current.resume();
-      }
-    }
+  const togglePlay = () => {
+    if (!engine.isPlaying) initAudio();
     setEngine(prev => ({ ...prev, isPlaying: !prev.isPlaying }));
   };
 
@@ -791,17 +827,88 @@ export default function App() {
                   <button 
                     onClick={() => setEngine(prev => ({ ...prev, zoom: prev.zoom === 1 ? 2 : prev.zoom === 2 ? 0.5 : 1 }))}
                     className={cn("p-2 hover:bg-white/5 rounded-lg transition-all", engine.zoom !== 1 ? "text-emerald-500" : "text-white/40")}
+                    title="Zoom View"
                   >
                     <Maximize2 className="w-4 h-4" />
                   </button>
                   <button 
-                    onClick={() => setShowVisualSettings(!showVisualSettings)}
+                    onClick={() => {
+                      setShowAudioSettings(!showAudioSettings);
+                      if (showVisualSettings) setShowVisualSettings(false);
+                    }}
+                    className={cn("p-2 hover:bg-white/5 rounded-lg transition-all", showAudioSettings ? "text-emerald-500" : "text-white/40")}
+                    title="Audio Settings"
+                  >
+                    <Volume2 className="w-4 h-4" />
+                  </button>
+                  <button 
+                    onClick={() => {
+                      setShowVisualSettings(!showVisualSettings);
+                      if (showAudioSettings) setShowAudioSettings(false);
+                    }}
                     className={cn("p-2 hover:bg-white/5 rounded-lg transition-all", showVisualSettings ? "text-emerald-500" : "text-white/40")}
+                    title="Visual Settings"
                   >
                     <Settings2 className="w-4 h-4" />
                   </button>
                </div>
             </div>
+
+            {/* Audio Settings Panel */}
+            <AnimatePresence>
+              {showAudioSettings && (
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                  className="absolute bottom-24 right-6 w-72 bg-black/90 backdrop-blur-2xl border border-white/10 rounded-2xl p-4 z-50 shadow-2xl flex flex-col"
+                >
+                  <div className="flex items-center justify-between mb-4 shrink-0">
+                    <div className="flex items-center gap-2">
+                      <Volume2 className="w-3 h-3 text-emerald-500" />
+                      <h3 className="text-[10px] font-bold uppercase tracking-widest text-white/60">Audio Output</h3>
+                    </div>
+                    <button onClick={refreshAudioDevices} className="p-1.5 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-white">
+                      <RefreshCw className="w-3 h-3" />
+                    </button>
+                  </div>
+                  
+                  <div className="space-y-3">
+                    <div className="space-y-1">
+                      <label className="text-[9px] text-white/30 uppercase block px-1">Select Driver / Device</label>
+                      <div className="space-y-1 max-h-48 overflow-y-auto custom-scrollbar pr-1">
+                        {audioDevices.length > 0 ? (
+                          audioDevices.map(device => (
+                            <button
+                              key={device.deviceId}
+                              onClick={() => handleAudioDeviceChange(device.deviceId)}
+                              className={cn(
+                                "w-full text-left px-3 py-2 rounded-lg text-xs transition-all border",
+                                selectedAudioDeviceId === device.deviceId 
+                                  ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400" 
+                                  : "bg-white/5 border-transparent text-white/60 hover:bg-white/10"
+                              )}
+                            >
+                              <div className="truncate font-medium">{device.label || `Audio Output ${device.deviceId.slice(0, 4)}`}</div>
+                            </button>
+                          ))
+                        ) : (
+                          <div className="text-[10px] text-white/20 italic p-2 bg-white/5 rounded-lg border border-dashed border-white/10">
+                            No output devices found or permission denied.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    
+                    <div className="pt-2 border-t border-white/5">
+                      <p className="text-[9px] text-white/20 leading-relaxed">
+                        Note: Browser security may require a user gesture (like clicking Play) before audio can be routed to specific devices.
+                      </p>
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
 
             {/* Visual Settings Panel */}
             <AnimatePresence>
