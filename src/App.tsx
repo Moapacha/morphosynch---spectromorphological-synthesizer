@@ -304,6 +304,9 @@ export default function App() {
     noise.start();
 
     audioNodesRef.current = { osc, filter, noise, noiseGain, masterGain };
+
+    // Required: resume AudioContext after user gesture (browser autoplay policy)
+    ctx.resume();
   }, []);
 
   // --- Curve Math ---
@@ -366,11 +369,11 @@ export default function App() {
       const { osc, filter, noiseGain, masterGain } = audioNodesRef.current;
       const now = audioCtxRef.current.currentTime;
       
-      if (values['audio.freq']) osc.frequency.setTargetAtTime(values['audio.freq'], now, 0.05);
-      if (values['audio.cutoff']) filter.frequency.setTargetAtTime(values['audio.cutoff'], now, 0.05);
-      if (values['audio.resonance']) filter.Q.setTargetAtTime(values['audio.resonance'], now, 0.05);
-      if (values['audio.noise']) noiseGain.gain.setTargetAtTime(values['audio.noise'], now, 0.05);
-      if (values['audio.gain']) masterGain.gain.setTargetAtTime(values['audio.gain'], now, 0.05);
+      osc.frequency.setTargetAtTime(values['audio.freq'] ?? 440, now, 0.05);
+      filter.frequency.setTargetAtTime(values['audio.cutoff'] ?? 2000, now, 0.05);
+      filter.Q.setTargetAtTime(values['audio.resonance'] ?? 1, now, 0.05);
+      noiseGain.gain.setTargetAtTime(values['audio.noise'] ?? 0, now, 0.05);
+      masterGain.gain.setTargetAtTime(values['audio.gain'] ?? 0, now, 0.05);
     }
 
     // Visual Update
@@ -500,8 +503,14 @@ export default function App() {
     };
   }, [engine.isPlaying, update]);
 
-  const togglePlay = () => {
-    if (!engine.isPlaying) initAudio();
+  const togglePlay = async () => {
+    if (!engine.isPlaying) {
+      initAudio();
+      // Must await resume - AudioContext starts suspended; audio is silent until resumed
+      if (audioCtxRef.current?.state === 'suspended') {
+        await audioCtxRef.current.resume();
+      }
+    }
     setEngine(prev => ({ ...prev, isPlaying: !prev.isPlaying }));
   };
 
