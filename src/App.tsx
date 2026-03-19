@@ -20,11 +20,17 @@ import {
   ChevronRight,
   ChevronDown,
   Volume2,
-  RefreshCw
+  RefreshCw,
+  Save,
+  FolderOpen,
+  Download,
+  Upload,
+  Bookmark
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as d3 from 'd3-shape';
 import { interpolate } from 'd3-interpolate';
+import * as d3Color from 'd3-color';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 
@@ -74,6 +80,18 @@ interface EngineState {
   duration: number; // in seconds
 }
 
+interface Preset {
+  id: string;
+  name: string;
+  timestamp: number;
+  data: {
+    curves: MorphologyCurve[];
+    visualContents: VisualContent[];
+    mappings: Mapping[];
+    duration: number;
+  };
+}
+
 // --- Constants ---
 
 const TRAJECTORY_COLORS = [
@@ -119,7 +137,13 @@ const INITIAL_MICRO_CURVE: MorphologyCurve = {
 
 const BASE_MAPPING_TARGETS = [
   { id: 'none', label: 'None', group: 'General' },
-  { id: 'audio.freq', label: 'Audio: Frequency (Pitch)', group: 'Audio' },
+  { id: 'audio.freq', label: 'Audio: Base Frequency', group: 'Audio' },
+  { id: 'audio.fmFreq', label: 'Audio: FM Frequency', group: 'Audio' },
+  { id: 'audio.fmDepth', label: 'Audio: FM Depth', group: 'Audio' },
+  { id: 'audio.polySides', label: 'Audio: Polygon Sides', group: 'Audio' },
+  { id: 'audio.rotateFreq', label: 'Audio: Rotation Freq', group: 'Audio' },
+  { id: 'audio.teeth', label: 'Audio: Teeth (Shape)', group: 'Audio' },
+  { id: 'audio.fold', label: 'Audio: Wave Fold', group: 'Audio' },
   { id: 'audio.cutoff', label: 'Audio: Filter Cutoff', group: 'Audio' },
   { id: 'audio.resonance', label: 'Audio: Filter Resonance', group: 'Audio' },
   { id: 'audio.noise', label: 'Audio: Noise Ratio', group: 'Audio' },
@@ -208,6 +232,9 @@ export default function App() {
   const [activeCurveId, setActiveCurveId] = useState<string>('macro-1');
   const [showVisualSettings, setShowVisualSettings] = useState(false);
   const [showAudioSettings, setShowAudioSettings] = useState(false);
+  const [showPresets, setShowPresets] = useState(false);
+  const [presets, setPresets] = useState<Preset[]>([]);
+  const [newPresetName, setNewPresetName] = useState('');
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedAudioDeviceId, setSelectedAudioDeviceId] = useState<string>('default');
   
@@ -257,7 +284,7 @@ export default function App() {
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const audioNodesRef = useRef<{
-    osc: OscillatorNode;
+    polySynth: AudioWorkletNode;
     filter: BiquadFilterNode;
     noise: AudioWorkletNode | AudioBufferSourceNode;
     noiseGain: GainNode;
@@ -308,18 +335,187 @@ export default function App() {
     }
   };
 
+  // --- Preset Management ---
+  useEffect(() => {
+    const saved = localStorage.getItem('morphosynch_presets');
+    if (saved) {
+      try {
+        setPresets(JSON.parse(saved));
+      } catch (e) {
+        console.error("Failed to parse presets", e);
+      }
+    }
+  }, []);
+
+  const savePreset = () => {
+    const name = newPresetName.trim() || `Preset ${presets.length + 1}`;
+    const newPreset: Preset = {
+      id: `preset-${Date.now()}`,
+      name,
+      timestamp: Date.now(),
+      data: {
+        curves,
+        visualContents,
+        mappings,
+        duration: engine.duration
+      }
+    };
+    const updated = [newPreset, ...presets];
+    setPresets(updated);
+    localStorage.setItem('morphosynch_presets', JSON.stringify(updated));
+    setNewPresetName('');
+  };
+
+  const loadPreset = (preset: Preset) => {
+    setCurves(preset.data.curves);
+    setVisualContents(preset.data.visualContents);
+    setMappings(preset.data.mappings);
+    setEngine(prev => ({ ...prev, duration: preset.data.duration }));
+    // If we have an active curve that no longer exists, reset it
+    if (!preset.data.curves.find(c => c.id === activeCurveId)) {
+      setActiveCurveId(preset.data.curves[0].id);
+    }
+  };
+
+  const deletePreset = (id: string) => {
+    const updated = presets.filter(p => p.id !== id);
+    setPresets(updated);
+    localStorage.setItem('morphosynch_presets', JSON.stringify(updated));
+  };
+
+  const exportPresets = () => {
+    const dataStr = JSON.stringify(presets, null, 2);
+    const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
+    const exportFileDefaultName = 'morphosynch_presets.json';
+    const linkElement = document.createElement('a');
+    linkElement.setAttribute('href', dataUri);
+    linkElement.setAttribute('download', exportFileDefaultName);
+    linkElement.click();
+  };
+
+  const importPresets = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const imported = JSON.parse(event.target?.result as string);
+        if (Array.isArray(imported)) {
+          const updated = [...imported, ...presets];
+          setPresets(updated);
+          localStorage.setItem('morphosynch_presets', JSON.stringify(updated));
+        }
+      } catch (err) {
+        console.error("Failed to import presets", err);
+      }
+    };
+    reader.readAsText(file);
+  };
+
   // --- Audio Engine ---
-  const initAudio = useCallback(() => {
+  const initAudio = useCallback(async () => {
     if (audioCtxRef.current) return;
     const ctx = new AudioContext();
     audioCtxRef.current = ctx;
 
-    const osc = ctx.createOscillator();
-    osc.type = 'sawtooth';
+    // Load Polygonal Synth Worklet
+    const workletCode = `
+      class PolygonalSynthProcessor extends AudioWorkletProcessor {
+        static get parameterDescriptors() {
+          return [
+            { name: 'frequency', defaultValue: 440, minValue: 0, maxValue: 20000 },
+            { name: 'fmFreq', defaultValue: 0, minValue: 0, maxValue: 10000 },
+            { name: 'fmDepth', defaultValue: 0, minValue: 0, maxValue: 1000 },
+            { name: 'polySides', defaultValue: 4, minValue: 2.1, maxValue: 50 },
+            { name: 'rotateFreq', defaultValue: 0, minValue: -1000, maxValue: 1000 },
+            { name: 'teeth', defaultValue: 0, minValue: 0, maxValue: 1 },
+            { name: 'fold', defaultValue: 0, minValue: 0, maxValue: 50 }
+          ];
+        }
+
+        constructor() {
+          super();
+          this.phase = 0;
+          this.fmPhase = 0;
+          this.rotatePhase = 0;
+        }
+
+        fold(x, lo, hi) {
+          const range = hi - lo;
+          const doubleRange = range * 2;
+          let val = (x - lo) % doubleRange;
+          if (val < 0) val += doubleRange;
+          if (val > range) val = doubleRange - val;
+          return val + lo;
+        }
+
+        process(inputs, outputs, parameters) {
+          const output = outputs[0];
+          const left = output[0];
+          const right = output[1];
+
+          const freq = parameters.frequency;
+          const fmFreq = parameters.fmFreq;
+          const fmDepth = parameters.fmDepth;
+          const polySides = parameters.polySides;
+          const rotateFreq = parameters.rotateFreq;
+          const teeth = parameters.teeth;
+          const fold = parameters.fold;
+
+          for (let i = 0; i < left.length; i++) {
+            const f = freq.length > 1 ? freq[i] : freq[0];
+            const ff = fmFreq.length > 1 ? fmFreq[i] : fmFreq[0];
+            const fd = fmDepth.length > 1 ? fmDepth[i] : fmDepth[0];
+            const ps = polySides.length > 1 ? polySides[i] : polySides[0];
+            const rf = rotateFreq.length > 1 ? rotateFreq[i] : rotateFreq[0];
+            const th = teeth.length > 1 ? teeth[i] : teeth[0];
+            const fl = fold.length > 1 ? fold[i] : fold[0];
+
+            this.fmPhase += ff / sampleRate;
+            if (this.fmPhase > 1) this.fmPhase -= 1;
+            const fmMod = Math.sin(this.fmPhase * 2 * Math.PI);
+
+            const currentFreq = f + fd * fmMod;
+            this.phase += currentFreq / sampleRate;
+            if (this.phase > 1) this.phase -= 1;
+            const t = 2 * Math.PI * this.phase;
+
+            this.rotatePhase += rf / sampleRate;
+            if (this.rotatePhase > 1) this.rotatePhase -= 1;
+            const rotate = 2 * Math.PI * this.rotatePhase;
+
+            const an = Math.PI / ps;
+            const shape = ((Math.PI * (ps - 2)) / (2 * ps)) * th;
+            
+            const cosAnShape = Math.cos(an + shape);
+            const denom = Math.cos(2 * an * ((this.phase * ps) % 1) - an + shape);
+            const factor = cosAnShape / (denom || 0.0001);
+
+            const x = Math.cos(t + rotate) * factor;
+            const y = Math.sin(t + rotate) * factor;
+
+            const foldFactor = fl + 1;
+            left[i] = this.fold(x * foldFactor, -1, 1);
+            right[i] = this.fold(y * foldFactor, -1, 1);
+          }
+
+          return true;
+        }
+      }
+      registerProcessor('polygonal-synth', PolygonalSynthProcessor);
+    `;
+
+    const blob = new Blob([workletCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await ctx.audioWorklet.addModule(url);
+
+    const polySynth = new AudioWorkletNode(ctx, 'polygonal-synth', {
+      outputChannelCount: [2]
+    });
     
     const filter = ctx.createBiquadFilter();
     filter.type = 'lowpass';
-    filter.frequency.value = 1000;
+    filter.frequency.value = 20000;
     filter.Q.value = 1;
 
     const masterGain = ctx.createGain();
@@ -339,16 +535,15 @@ export default function App() {
     const noiseGain = ctx.createGain();
     noiseGain.gain.value = 0;
 
-    osc.connect(filter);
+    polySynth.connect(filter);
     filter.connect(masterGain);
     noise.connect(noiseGain);
     noiseGain.connect(masterGain);
     masterGain.connect(ctx.destination);
 
-    osc.start();
     noise.start();
 
-    audioNodesRef.current = { osc, filter, noise, noiseGain, masterGain };
+    audioNodesRef.current = { polySynth, filter, noise, noiseGain, masterGain };
   }, []);
 
   // --- Curve Math ---
@@ -395,7 +590,13 @@ export default function App() {
     const values: Record<string, number> = {
       'audio.gain': 0, // Default to silence if not mapped
       'audio.freq': 440,
-      'audio.cutoff': 2000,
+      'audio.fmFreq': 0,
+      'audio.fmDepth': 0,
+      'audio.polySides': 4,
+      'audio.rotateFreq': 0,
+      'audio.teeth': 0,
+      'audio.fold': 0,
+      'audio.cutoff': 20000,
       'audio.resonance': 1,
       'audio.noise': 0
     };
@@ -408,14 +609,21 @@ export default function App() {
 
     // Audio Update
     if (audioNodesRef.current && audioCtxRef.current) {
-      const { osc, filter, noiseGain, masterGain } = audioNodesRef.current;
+      const { polySynth, filter, noiseGain, masterGain } = audioNodesRef.current;
       const now = audioCtxRef.current.currentTime;
       
-      if (values['audio.freq']) osc.frequency.setTargetAtTime(values['audio.freq'], now, 0.05);
-      if (values['audio.cutoff']) filter.frequency.setTargetAtTime(values['audio.cutoff'], now, 0.05);
-      if (values['audio.resonance']) filter.Q.setTargetAtTime(values['audio.resonance'], now, 0.05);
-      if (values['audio.noise']) noiseGain.gain.setTargetAtTime(values['audio.noise'], now, 0.05);
-      if (values['audio.gain']) masterGain.gain.setTargetAtTime(values['audio.gain'], now, 0.05);
+      if (values['audio.freq'] !== undefined) polySynth.parameters.get('frequency')?.setTargetAtTime(values['audio.freq'], now, 0.05);
+      if (values['audio.fmFreq'] !== undefined) polySynth.parameters.get('fmFreq')?.setTargetAtTime(values['audio.fmFreq'], now, 0.05);
+      if (values['audio.fmDepth'] !== undefined) polySynth.parameters.get('fmDepth')?.setTargetAtTime(values['audio.fmDepth'], now, 0.05);
+      if (values['audio.polySides'] !== undefined) polySynth.parameters.get('polySides')?.setTargetAtTime(values['audio.polySides'], now, 0.05);
+      if (values['audio.rotateFreq'] !== undefined) polySynth.parameters.get('rotateFreq')?.setTargetAtTime(values['audio.rotateFreq'], now, 0.05);
+      if (values['audio.teeth'] !== undefined) polySynth.parameters.get('teeth')?.setTargetAtTime(values['audio.teeth'], now, 0.05);
+      if (values['audio.fold'] !== undefined) polySynth.parameters.get('fold')?.setTargetAtTime(values['audio.fold'], now, 0.05);
+
+      if (values['audio.cutoff'] !== undefined) filter.frequency.setTargetAtTime(values['audio.cutoff'], now, 0.05);
+      if (values['audio.resonance'] !== undefined) filter.Q.setTargetAtTime(values['audio.resonance'], now, 0.05);
+      if (values['audio.noise'] !== undefined) noiseGain.gain.setTargetAtTime(values['audio.noise'], now, 0.05);
+      if (values['audio.gain'] !== undefined) masterGain.gain.setTargetAtTime(values['audio.gain'], now, 0.05);
     }
 
     // Visual Update
@@ -442,11 +650,12 @@ export default function App() {
           const state = visualStateRef.current[vc.id];
           if (!state) return;
 
+          const baseColor = d3Color.hsl(vc.color);
           const objValues: Record<string, number> = {
             scale: 1,
             rotationSpeed: 0,
             complexity: 0,
-            hue: 200,
+            hue: baseColor.h || 0,
             x: 0.5,
             y: 0.5,
           };
@@ -479,7 +688,7 @@ export default function App() {
           ctx.scale(objValues.scale, objValues.scale);
 
           ctx.strokeStyle = `hsla(${objValues.hue}, 85%, 70%, 1.0)`;
-          ctx.lineWidth = 3 / (objValues.scale * zoom);
+          ctx.lineWidth = 1.25 / (objValues.scale * zoom);
 
           if (vc.type === 'geometry') {
             let sides = 3;
@@ -514,7 +723,7 @@ export default function App() {
             for (let i = 0; i < particleCount; i++) {
               const pAngle = (i / particleCount) * Math.PI * 2 + normalizedTime * 4;
               const pR = (70 + Math.cos(normalizedTime * 8 + i) * 30) * (1 + state.complexity * 0.5);
-              ctx.fillStyle = `hsla(${objValues.hue + i * 3}, 80%, 65%, 0.7)`;
+              ctx.fillStyle = `hsla(${objValues.hue + i * 3}, 80%, 85%, 0.7)`;
               ctx.beginPath();
               ctx.arc(Math.cos(pAngle) * pR, Math.sin(pAngle) * pR, (2 + state.complexity * 3) / (objValues.scale * zoom), 0, Math.PI * 2);
               ctx.fill();
@@ -603,6 +812,14 @@ export default function App() {
           else if (updates.target.endsWith('.complexity')) newMap.range = [0, 1];
           else if (updates.target.endsWith('.hue')) newMap.range = [0, 360];
           else if (updates.target.endsWith('.x') || updates.target.endsWith('.y')) newMap.range = [0, 1];
+          // Audio defaults
+          else if (updates.target === 'audio.freq') newMap.range = [50, 2000];
+          else if (updates.target === 'audio.fmFreq') newMap.range = [0, 1000];
+          else if (updates.target === 'audio.fmDepth') newMap.range = [0, 500];
+          else if (updates.target === 'audio.polySides') newMap.range = [3, 20];
+          else if (updates.target === 'audio.rotateFreq') newMap.range = [-100, 100];
+          else if (updates.target === 'audio.teeth') newMap.range = [0, 1];
+          else if (updates.target === 'audio.fold') newMap.range = [0, 10];
         }
         return newMap;
       }
@@ -835,6 +1052,7 @@ export default function App() {
                     onClick={() => {
                       setShowAudioSettings(!showAudioSettings);
                       if (showVisualSettings) setShowVisualSettings(false);
+                      if (showPresets) setShowPresets(false);
                     }}
                     className={cn("p-2 hover:bg-white/5 rounded-lg transition-all", showAudioSettings ? "text-emerald-500" : "text-white/40")}
                     title="Audio Settings"
@@ -843,8 +1061,20 @@ export default function App() {
                   </button>
                   <button 
                     onClick={() => {
+                      setShowPresets(!showPresets);
+                      if (showVisualSettings) setShowVisualSettings(false);
+                      if (showAudioSettings) setShowAudioSettings(false);
+                    }}
+                    className={cn("p-2 hover:bg-white/5 rounded-lg transition-all", showPresets ? "text-emerald-500" : "text-white/40")}
+                    title="Presets"
+                  >
+                    <Bookmark className="w-4 h-4" />
+                  </button>
+                  <button 
+                    onClick={() => {
                       setShowVisualSettings(!showVisualSettings);
                       if (showAudioSettings) setShowAudioSettings(false);
+                      if (showPresets) setShowPresets(false);
                     }}
                     className={cn("p-2 hover:bg-white/5 rounded-lg transition-all", showVisualSettings ? "text-emerald-500" : "text-white/40")}
                     title="Visual Settings"
@@ -853,6 +1083,89 @@ export default function App() {
                   </button>
                </div>
             </div>
+
+            {/* Presets Panel */}
+            <AnimatePresence>
+              {showPresets && (
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                  className="absolute bottom-24 right-6 w-80 bg-black/90 backdrop-blur-2xl border border-white/10 rounded-2xl p-4 z-50 shadow-2xl flex flex-col max-h-[500px]"
+                >
+                  <div className="flex items-center justify-between mb-4 shrink-0">
+                    <div className="flex items-center gap-2">
+                      <Bookmark className="w-3 h-3 text-emerald-500" />
+                      <h3 className="text-[10px] font-bold uppercase tracking-widest text-white/60">Presets Library</h3>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <label className="p-1.5 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-white cursor-pointer" title="Import">
+                        <Upload className="w-3 h-3" />
+                        <input type="file" className="hidden" onChange={importPresets} accept=".json" />
+                      </label>
+                      <button onClick={exportPresets} className="p-1.5 hover:bg-white/10 rounded-lg transition-colors text-white/40 hover:text-white" title="Export All">
+                        <Download className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4 flex-1 overflow-hidden flex flex-col">
+                    {/* Save Current */}
+                    <div className="p-3 rounded-xl bg-emerald-500/5 border border-emerald-500/10 space-y-2">
+                      <label className="text-[9px] text-emerald-500/60 uppercase block px-1">Save Current State</label>
+                      <div className="flex gap-2">
+                        <input 
+                          value={newPresetName}
+                          onChange={(e) => setNewPresetName(e.target.value)}
+                          placeholder="Preset name..."
+                          className="flex-1 bg-black/40 border border-white/10 rounded-lg px-3 py-1.5 text-xs outline-none focus:border-emerald-500/50 transition-colors"
+                        />
+                        <button 
+                          onClick={savePreset}
+                          className="p-1.5 bg-emerald-500 text-black rounded-lg hover:bg-emerald-400 transition-colors"
+                        >
+                          <Save className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Presets List */}
+                    <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 -mr-2 space-y-2">
+                      {presets.length > 0 ? (
+                        presets.map(p => (
+                          <div key={p.id} className="group p-3 rounded-xl bg-white/5 border border-white/5 hover:border-white/10 transition-all flex items-center justify-between">
+                            <div className="flex-1 min-w-0 mr-3">
+                              <div className="text-xs font-medium text-white/80 truncate">{p.name}</div>
+                              <div className="text-[9px] text-white/30 font-mono">{new Date(p.timestamp).toLocaleString()}</div>
+                            </div>
+                            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <button 
+                                onClick={() => loadPreset(p)}
+                                className="p-1.5 hover:bg-emerald-500/20 text-emerald-500 rounded-lg transition-colors"
+                                title="Load"
+                              >
+                                <FolderOpen className="w-3.5 h-3.5" />
+                              </button>
+                              <button 
+                                onClick={() => deletePreset(p.id)}
+                                className="p-1.5 hover:bg-red-500/20 text-red-500 rounded-lg transition-colors"
+                                title="Delete"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="text-[10px] text-white/20 italic p-4 text-center border border-dashed border-white/10 rounded-xl">
+                          No presets saved yet.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
 
             {/* Audio Settings Panel */}
             <AnimatePresence>
@@ -1239,7 +1552,7 @@ function CurveCanvas({ activeCurve, allCurves, onAddPoint, onMovePoint, onRemove
                 d={getPathData(c, false) || ''} 
                 fill="none" 
                 stroke={c.color} 
-                strokeWidth="1" 
+                strokeWidth="0.25" 
                 strokeOpacity={isActive ? "0.2" : "0.1"}
                 strokeDasharray="2,2"
                 strokeLinecap="round"
@@ -1249,7 +1562,7 @@ function CurveCanvas({ activeCurve, allCurves, onAddPoint, onMovePoint, onRemove
                 d={getPathData(c, true) || ''} 
                 fill="none" 
                 stroke={c.color} 
-                strokeWidth={isActive ? "2.5" : "1.5"} 
+                strokeWidth={isActive ? "1.0" : "0.5"} 
                 strokeOpacity={isActive ? "1" : "0.4"}
                 strokeLinecap="round"
                 className={cn(isActive && "drop-shadow-[0_0_8px_rgba(255,255,255,0.3)]")}
